@@ -1,71 +1,37 @@
 # main.py
-import os
-import io
-import re
-import time
-import json
-import base64
-import logging
-import traceback
-from datetime import datetime
-from typing import Dict, List, Optional
-
-import requests
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer
+import os
 from dotenv import load_dotenv
+import requests
+import logging
+import traceback
+import time
+from datetime import datetime
+from typing import Dict
+from openai import OpenAI
+import base64
+import json
+import re
 from PIL import Image
+import io
 
-# Optional OpenAI client import (your code used OpenAI)
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
+# ---- Chatbot mount -------------------------------------------------
+from chatbot import chatbot_app
 
-# Try to import chatbot_app if available (safe)
-try:
-    from chatbot import chatbot_app  # type: ignore
-    HAVE_CHATBOT = True
-except Exception:
-    HAVE_CHATBOT = False
-
-# -------------------- Configuration & Env --------------------
-load_dotenv()  # loads .env if present
-
-API_KEY = os.getenv("API_AUTH_KEY", "cropbot-secret-key")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-# Optional OpenAI client
-if OPENAI_API_KEY and OpenAI:
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
-else:
-    openai_client = None
-
-# Gemini endpoint
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-
-# Rate limit config
-MAX_REQUESTS_PER_MINUTE = int(os.getenv("MAX_REQUESTS_PER_MINUTE", "120"))
-
-# File constraints
-ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
-
-# -------------------- Logging & App --------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("cropbot")
+# ---- Logging -------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="CropBot API", version="1.0.0")
+app.mount("/chat", chatbot_app)
 
-if HAVE_CHATBOT:
-    app.mount("/chat", chatbot_app)
-    logger.info("Mounted chatbot_app at /chat")
-else:
-    logger.info("chatbot_app not found; skipping mount")
-
+# ---- CORS ----------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -74,378 +40,293 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---- Security ------------------------------------------------------
 security = HTTPBearer()
+load_dotenv("C:/Users/chara/cropbot_backend/.env")
+API_KEY = os.getenv("API_AUTH_KEY", "cropbot-secret-key")
 
-# In-memory counters/caches (process-level)
-request_count = 0
-last_reset = time.time()
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+gemini_api_key = os.getenv("GEMINI_API_KEY")
+
+# ---- Rate-limit & cache -------------------------------------------
 remedy_cache: Dict[str, str] = {}
+request_count = 0
+MAX_REQUESTS_PER_MINUTE = 100
+last_reset = time.time()
 
-# -------------------- Small helpers --------------------
-def strip_code_fences_and_control_chars(text: str) -> str:
-    """
-    Remove common markdown code fences and non-printable/control characters that break json.loads.
-    Keeps newline and horizontal whitespace.
-    """
-    if not isinstance(text, str):
-        return text
-    # Remove triple backtick fences and language hints (e.g., ```json)
-    text = re.sub(r"```(?:\w+)?\s*", "", text)
-    text = text.replace("```", "")
-    # Remove stray single backticks
-    text = text.replace("`", "")
-    # Remove BOM and other control chars except newline / tab
-    cleaned = "".join(ch for ch in text if (ord(ch) >= 32) or ch in ("\n", "\t"))
-    # Strip leading/trailing whitespace
-    return cleaned.strip()
+# ---- File constraints ----------------------------------------------
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+MAX_FILE_SIZE = 10 * 1024 * 1024   # 10 MB
 
-def _extract_first_json_object(text: str) -> Optional[dict]:
-    """
-    Extract the first {...} JSON object from text. Return dict or None.
-    Uses a safe greedy fallback and strips control chars first.
-    """
-    if not text:
-        return None
-    text = strip_code_fences_and_control_chars(text)
-    # Find the first balanced JSON object using a regex that works for typical outputs
-    match = re.search(r"\{(?:[^{}]|(?R))*\}", text, re.DOTALL) if hasattr(re, "search") else re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
-        # fallback: find braces with simple greedy
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
-        return None
-    candidate = match.group()
-    try:
-        return json.loads(candidate)
-    except Exception as e:
-        logger.debug(f"JSON parse failed after cleaning: {e}. Raw candidate: {candidate}")
-        # As a last resort, attempt to replace smart quotes and re-try
-        normalized = candidate.replace("\u2018", "'").replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"')
-        try:
-            return json.loads(normalized)
-        except Exception as ee:
-            logger.warning(f"Final JSON parse failed: {ee}")
-            return None
+# ---- HTML TEST PAGE ------------------------------------------------
+html_template = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>CropBot AI</title>
+    <style>
+        body { font-family: Arial; padding: 20px; background: #f4f4f4; }
+        .container { max-width: 600px; margin: auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+        input[type="file"] { margin: 10px 0; }
+        button { background: #45c91d; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; }
+        pre { background: #f0f0f0; padding: 15px; border-radius: 5px; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h2>Upload Crop Image</h2>
+    <input type="file" id="fileInput" accept="image/*">
+    <button onclick="upload()">Upload and Predict</button>
+    <h3>Result:</h3>
+    <pre id="result">Waiting...</pre>
+</div>
 
-def compress_image(file_content: bytes, max_size: int = 512) -> bytes:
-    """Compress image to JPEG thumbnail to reduce upload size/time."""
-    try:
-        img = Image.open(io.BytesIO(file_content))
-        img = img.convert("RGB")
-        img.thumbnail((max_size, max_size))
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
-        return buf.getvalue()
-    except Exception as e:
-        logger.warning(f"Image compression failed: {e}")
-        return file_content
+<script>
+async function upload() {
+    const file = document.getElementById('fileInput').files[0];
+    if (!file) return alert("Please select an image");
 
-def validate_file(file: UploadFile, content: Optional[bytes] = None):
-    """Validate file presence, extension, and size."""
-    if not file or not getattr(file, "filename", None):
-        raise HTTPException(status_code=400, detail="No file uploaded")
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const response = await fetch('/predict', {
+        method: 'POST',
+        body: formData,
+        headers: { 'Authorization': 'Bearer cropbot-secret-key' }
+    });
+
+    const data = await response.json();
+    document.getElementById('result').textContent = JSON.stringify(data, null, 2);
+}
+</script>
+</body>
+</html>
+"""
+
+# --------------------------------------------------------------------
+def verify_api_key(api_key: str = Depends(security)):
+    if api_key.credentials != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+
+    global request_count, last_reset
+    now = time.time()
+    if now - last_reset > 60:
+        request_count = 0
+        last_reset = now
+
+    request_count += 1
+    if request_count > MAX_REQUESTS_PER_MINUTE:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+    return api_key
+
+# --------------------------------------------------------------------
+def validate_file(file: UploadFile, content: bytes | None = None):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file selected")
+
     ext = os.path.splitext(file.filename.lower())[1]
     if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status_code=400, detail=f"Invalid file type. Allowed: {', '.join(ALLOWED_EXTENSIONS)}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
+        )
+
     if content and len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="File too large (max 10 MB)")
 
-# -------------------- Gemini call --------------------
-def call_gemini_api(file_content: bytes, filename: str, max_retries: int = 4) -> Dict:
-    """
-    Call Gemini 2.5-flash to get structured plant disease JSON.
-    - Uses correct camelCase keys: inlineData, mimeType
-    - Forces JSON-only response in prompt
-    - Cleans fences, control chars, retries on transient errors (503/timeouts)
-    """
-    if not GEMINI_API_KEY:
-        raise HTTPException(status_code=500, detail="Gemini API key missing")
+# --------------------------------------------------------------------
+def compress_image(file_content: bytes) -> bytes:
+    """Compress image to 512x512 max size to reduce Gemini upload time."""
+    try:
+        img = Image.open(io.BytesIO(file_content))
+        img = img.convert("RGB")
+        img.thumbnail((512, 512))   # Resize
 
+        buffer = io.BytesIO()
+        img.save(buffer, format="JPEG", quality=85)
+        return buffer.getvalue()
+    except Exception:
+        return file_content  # fallback
+
+# --------------------------------------------------------------------
+def call_gemini_api(file_content: bytes, filename: str) -> Dict:
+    """
+    Gemini 2.5 Flash – Stable model for image analysis (v1, 2025).
+    """
     b64 = base64.b64encode(file_content).decode("utf-8")
-
-    # Strict prompt that asks for only JSON and an exact structure
     prompt = (
-        "You are a plant disease classifier. Analyze the attached image and "
-        "RETURN ONLY a single JSON object, with NO MARKDOWN, NO EXPLANATION, NO TRIPLE BACKTICKS.\n\n"
-        "The JSON MUST exactly include these fields:\n"
-        "scientific_name (string), common_name (string), disease (string or 'None'), "
-        "confidence (number 0-100), causes (array of 2-3 strings).\n\n"
-        "Example:\n"
-        "{\"scientific_name\":\"Solanum lycopersicum\",\"common_name\":\"Tomato\",\"disease\":\"Late Blight\",\"confidence\":94.5,\"causes\":[\"High humidity\",\"Fungal spores\"]}\n\n"
-        "Return only the JSON object."
+        "Analyze this plant leaf image. Return ONLY JSON with:\n"
+        "- scientific_name\n"
+        "- common_name\n"
+        "- disease ('None' if healthy)\n"
+        "- confidence (0-100)\n"
+        "- causes (2-3 causes)\n"
+        "Example: {\"scientific_name\": \"Solanum lycopersicum\", \"common_name\": \"Tomato\", \"disease\": \"Late Blight\", \"confidence\": 94.5, \"causes\": [\"High humidity\", \"Fungal spores\"]}"
+    )
+
+    # FIXED: v1 endpoint + stable 2.5 Flash model
+    url = (
+        f"https://generativelanguage.googleapis.com/v1/models/"
+        f"gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
     )
 
     payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [
-                    {"text": prompt},
-                    {
-                        "inlineData": {
-                            "mimeType": "image/jpeg",
-                            "data": b64
-                        }
-                    }
-                ]
-            }
-        ],
-        # generationConfig optional tweaks can be added here
-        "generationConfig": {
-            "temperature": 0.0,
-            # You can add other fields like maxOutputTokens or thinkingBudget if desired
-        }
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": "image/jpeg", "data": b64}}
+            ]
+        }]
     }
 
-    headers = {
-        "Content-Type": "application/json",
-        "x-goog-api-key": GEMINI_API_KEY
-    }
-
-    backoff = 1.0
-    last_text = None
-    for attempt in range(1, max_retries + 1):
+    for attempt in range(3):
         try:
-            resp = requests.post(GEMINI_URL, json=payload, headers=headers, timeout=40)
-            # If overloaded, retry with backoff
-            if resp.status_code == 503:
-                logger.warning(f"Gemini overloaded (503). Attempt {attempt}/{max_retries}. Backoff {backoff}s.")
-                time.sleep(backoff)
-                backoff *= 2
-                continue
+            response = requests.post(url, json=payload, timeout=50)
+            response.raise_for_status()
 
-            resp.raise_for_status()
-            j = resp.json()
-            logger.debug("Gemini raw response: %s", j)
+            result = response.json()
+            logger.info(f"Gemini result: {result}")
 
-            # Try multiple possible response shapes to extract text
-            text_out = ""
-            try:
-                candidates = j.get("candidates")
-                if candidates and isinstance(candidates, list) and len(candidates) > 0:
-                    cand = candidates[0]
-                    content = cand.get("content") or {}
-                    parts = content.get("parts") or []
-                    for p in parts:
-                        if isinstance(p, dict) and "text" in p and p.get("text"):
-                            text_out += p.get("text", "")
-                        elif isinstance(p, dict) and "content" in p and isinstance(p["content"], str):
-                            text_out += p["content"]
-            except Exception:
-                text_out = ""
+            text_part = result["candidates"][0]["content"]["parts"][0]["text"]
 
-            # fallback fields
-            if not text_out:
-                text_out = j.get("output_text") or j.get("text") or json.dumps(j)
-
-            last_text = text_out
-
-            # Clean text and extract JSON
-            parsed = _extract_first_json_object(text_out)
-            if parsed:
-                # Normalize and return
+            json_match = re.search(r"\{.*\}", text_part, re.DOTALL)
+            if not json_match:
                 return {
-                    "scientific_name": parsed.get("scientific_name", "Unknown"),
-                    "common_name": parsed.get("common_name", "Unknown"),
-                    "disease": parsed.get("disease", "None"),
-                    "confidence": float(parsed.get("confidence", 0.0)),
-                    "causes": parsed.get("causes", []) if isinstance(parsed.get("causes", []), list) else []
+                    "scientific_name": "Unknown",
+                    "common_name": "Unknown",
+                    "disease": "None",
+                    "confidence": 0.0,
+                    "causes": []
                 }
-            else:
-                logger.warning("Gemini returned no parsable JSON. Attempt %s/%s. Raw text: %s", attempt, max_retries, strip_code_fences_and_control_chars(text_out))
-                if attempt == max_retries:
-                    # Final fallback to Unknown
-                    return {
-                        "scientific_name": "Unknown",
-                        "common_name": "Unknown",
-                        "disease": "None",
-                        "confidence": 0.0,
-                        "causes": []
-                    }
-                time.sleep(backoff)
-                backoff *= 2
-                continue
+
+            data = json.loads(json_match.group())
+            return {
+                "scientific_name": data.get("scientific_name", "Unknown"),
+                "common_name": data.get("common_name", "Unknown"),
+                "disease": data.get("disease", "None"),
+                "confidence": float(data.get("confidence", 0.0)),
+                "causes": data.get("causes", [])
+            }
 
         except requests.exceptions.Timeout:
-            logger.warning("Gemini request timed out. Attempt %s/%s. Backoff %ss", attempt, max_retries, backoff)
-            if attempt == max_retries:
-                raise HTTPException(status_code=503, detail="Gemini timed out")
-            time.sleep(backoff)
-            backoff *= 2
-            continue
-        except requests.exceptions.HTTPError as he:
-            logger.error("Gemini HTTP error: %s - raw: %s", he, getattr(resp, "text", None))
-            if attempt == max_retries:
-                raise HTTPException(status_code=503, detail="Gemini service unavailable")
-            time.sleep(backoff)
-            backoff *= 2
-            continue
+            logger.warning(f"Gemini timeout retry {attempt + 1}/3")
+            if attempt == 2:
+                raise HTTPException(503, "Gemini API timed out")
+
         except Exception as e:
-            logger.error("Unexpected Gemini error: %s - last resp text: %s", e, strip_code_fences_and_control_chars(last_text) if last_text else None)
-            if attempt == max_retries:
-                raise HTTPException(status_code=503, detail="Gemini service unavailable")
-            time.sleep(backoff)
-            backoff *= 2
-            continue
+            logger.error(f"Gemini API error: {e}")
+            if attempt == 2:
+                raise HTTPException(503, "Gemini service unavailable")
+            time.sleep(1)
 
-    # Shouldn't reach here
-    raise HTTPException(status_code=503, detail="Gemini failed after retries")
+# --------------------------------------------------------------------
+def get_remedy_from_openai(scientific_name: str, common_name: str, disease: str, causes: list) -> str:
+    """Generate remedy text using OpenAI."""
 
-# -------------------- OpenAI remedy generator (fallback/cache) --------------------
-def get_remedy_from_openai(scientific_name: str, common_name: str, disease: str, causes: List[str]) -> str:
-    """
-    Generate a short remedy using OpenAI. If OpenAI not configured, return a conservative fallback string.
-    """
     key = f"{scientific_name}_{disease}".lower()
     if key in remedy_cache:
         return remedy_cache[key]
 
-    causes_str = "\n".join([f"- {c}" for c in causes]) if causes else "- No causes detected"
+    causes_str = "\n".join([f"- {c}" for c in causes]) or "- No causes detected"
 
     prompt = (
         f"Plant: {common_name} ({scientific_name})\n"
         f"Disease: {disease}\n"
         f"Causes:\n{causes_str}\n\n"
-        "Provide a concise remedy in plain English using the sections:\n"
-        "Disease Name:\nCauses:\nNatural Solutions:\nChemical Solutions:\nCare Tips:\nKeep it short (about 120-200 tokens)."
+        "Provide remedy in English using:\n"
+        "**Disease Name:**\n"
+        "**Causes:**\n"
+        "**Natural Solutions:**\n"
+        "**Chemical Solutions:**\n"
+        "**Care Tips:**\n"
+        "Keep under 180 tokens."
     )
-
-    # If OpenAI client not configured, return simple fallback
-    if not openai_client:
-        fallback = (
-            f"Disease Name: {disease}\n"
-            f"Causes:\n{causes_str}\n"
-            "Natural Solutions: - Remove infected tissue, increase airflow, use neem oil\n"
-            "Chemical Solutions: - Apply recommended pesticide/fungicide per label\n"
-            "Care Tips: - Avoid overhead watering; monitor crop"
-        )
-        remedy_cache[key] = fallback
-        return fallback
 
     try:
         resp = openai_client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a helpful plant disease agronomist."},
+                {"role": "system", "content": "You are a plant disease expert."},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=220,
-            temperature=0.2
+            max_tokens=180,
+            temperature=0.3
         )
         remedy = resp.choices[0].message.content.strip()
         remedy_cache[key] = remedy
         return remedy
+
     except Exception as e:
-        logger.error("OpenAI error: %s", e)
-        fallback = (
+        logger.error(f"OpenAI error: {e}")
+        return (
             f"Disease Name: {disease}\n"
             f"Causes:\n{causes_str}\n"
-            "Natural Solutions: - Remove infected leaves, improve airflow\n"
-            "Chemical Solutions: - Use appropriate fungicide\n"
-            "Care Tips: - Avoid overhead watering"
+            "Natural Solutions: - Remove infected leaves\n"
+            "Chemical Solutions: - Use recommended fungicide\n"
+            "Care Tips: - Improve air flow"
         )
-        remedy_cache[key] = fallback
-        return fallback
 
-# -------------------- Auth middleware --------------------
-def verify_api_key(api_key: str = Depends(security)):
-    """Verify Bearer API key and basic per-process rate limit."""
-    global request_count, last_reset
-    if api_key.credentials != API_KEY:
-        raise HTTPException(status_code=403, detail="Invalid API key")
-    now = time.time()
-    if now - last_reset > 60:
-        request_count = 0
-        last_reset = now
-    request_count += 1
-    if request_count > MAX_REQUESTS_PER_MINUTE:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded")
-    return api_key
-
-# -------------------- Routes --------------------
-html_template = """
-<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><title>CropBot AI</title></head>
-<body>
-  <h2>CropBot AI - Upload</h2>
-  <input type="file" id="fileInput" accept="image/*" />
-  <button onclick="upload()">Upload</button>
-  <pre id="out">Waiting...</pre>
-  <script>
-  async function upload() {
-    const f = document.getElementById('fileInput').files[0];
-    if(!f) return alert("choose file");
-    const fd = new FormData();
-    fd.append('file', f);
-    const res = await fetch('/predict', {
-      method: 'POST',
-      body: fd,
-      headers: {'Authorization': 'Bearer ' + '""" + API_KEY + """'}
-    });
-    const j = await res.json();
-    document.getElementById('out').innerText = JSON.stringify(j, null, 2);
-  }
-  </script>
-</body>
-</html>
-"""
-
+# --------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 async def root():
     return HTMLResponse(content=html_template)
 
+# --------------------------------------------------------------------
 @app.post("/predict")
-async def predict_disease(file: UploadFile = File(...), api_key: str = Depends(verify_api_key)):
+async def predict_disease(
+    file: UploadFile = File(...),
+    api_key: str = Depends(verify_api_key)
+):
     start = time.time()
     try:
         content = await file.read()
+
+        # ---- Compress image (major speed improvement) ----
+        content = compress_image(content)
+
         validate_file(file, content)
 
-        # compress to speed up uploads
-        content = compress_image(content, max_size=512)
-
-        # call Gemini -> returns normalized dict
+        # Step 1: Gemini analysis
         gemini_result = call_gemini_api(content, file.filename)
 
-        sci_name = gemini_result.get("scientific_name", "Unknown")
-        com_name = gemini_result.get("common_name", "Unknown")
-        disease = gemini_result.get("disease", "None")
-        confidence = float(gemini_result.get("confidence", 0.0))
-        causes = gemini_result.get("causes", []) or []
+        sci_name = gemini_result["scientific_name"]
+        com_name = gemini_result["common_name"]
+        disease = gemini_result["disease"]
+        confidence = gemini_result["confidence"]
+        causes = gemini_result["causes"]
 
-        # generate remedy using OpenAI (or fallback)
+        # Step 2: OpenAI remedy
         remedy = get_remedy_from_openai(sci_name, com_name, disease, causes)
 
-        response = {
+        return JSONResponse({
             "status": "success",
             "scientific_name": sci_name,
             "common_name": com_name,
-            "disease": disease,
             "confidence": round(confidence, 1),
+            "disease": disease,
             "causes": causes,
             "recommendations": remedy,
-            "time_seconds": round(time.time() - start, 2)
-        }
-        return JSONResponse(response)
+            "time": round(time.time() - start, 2)
+        })
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("Prediction error: %s\n%s", e, traceback.format_exc())
+        logger.error(f"Prediction error: {e}\n{traceback.format_exc()}")
         return JSONResponse({
             "status": "error",
             "message": "Internal server error",
-            "error": str(e),
-            "time_seconds": round(time.time() - start, 2)
-        }, status_code=500)
+            "time": round(time.time() - start, 2)
+        })
 
+# --------------------------------------------------------------------
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "service": "cropbot", "time": datetime.utcnow().isoformat()}
+    return {"status": "healthy", "service": "cropbot", "time": datetime.now().isoformat()}
 
-# -------------------- CLI runner --------------------
+# --------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    logger.info("Starting CropBot on 0.0.0.0:%s", os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)), log_level="info")
+    logger.info("Starting CropBot on 0.0.0.0:8000")
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
