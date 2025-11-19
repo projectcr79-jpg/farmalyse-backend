@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Environments
+venv/
+.venv/
+env/
+ENV/
+
+# FastAPI / Build
+dist/
+build/
+
+# Secrets
+.env
+
+# ML models / datasets
+*.pt
+*.pth
+*.onnx
+models/
+checkpoints/
+runs/
+datasets/
+
+# OS / Editor junk
+.DS_Store
+.vscode/
+.idea/
+
+# Node / Flutter (just in case folders exist)
+node_modules/
+pubspec.lock
+.build/
+.android/
+.ios/
+rmdir .git /s /q
+venv/
+venv311/
+__pycache__/
+*.pyc
+.env
