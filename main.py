@@ -151,32 +151,41 @@ def compress_image(file_content: bytes) -> bytes:
         return file_content  # fallback
 
 # --------------------------------------------------------------------
-import google.generativeai as genai
-
 def call_gemini_api(file_content: bytes, filename: str) -> Dict:
     try:
-        # Configure with your key
+        # Configure Gemini
         genai.configure(api_key=gemini_api_key)
-        
-        # Use the stable public model
-        model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
-            safety_settings=[]  # Required for Render to avoid blocks
+
+        # Create in-memory file with explicit mime_type
+        from io import BytesIO
+        image_file = BytesIO(file_content)
+        image_file.name = filename  # Set filename for SDK
+
+        # Upload with mime_type
+        uploaded_file = genai.upload_file(
+            image_file, 
+            mime_type="image/jpeg"  # ← FIXED: Explicit mime_type
         )
-        
-        # Upload image
-        uploaded_file = genai.upload_file(io.BytesIO(file_content))
-        
-        # Generate response
-        response = model.generate_content(
-            [uploaded_file, "Analyze this crop/plant leaf. Return ONLY valid JSON with keys: scientific_name, common_name, disease, confidence (0-100), causes (list). Example: {\"scientific_name\": \"Solanum lycopersicum\", \"common_name\": \"Tomato\", \"disease\": \"Late Blight\", \"confidence\": 94.5, \"causes\": [\"High humidity\", \"Fungal spores\"]}"]
-        )
-        
+
+        # Generate content
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        response = model.generate_content([
+            uploaded_file,
+            "Analyze this plant leaf image. Return ONLY valid JSON:\n"
+            "{\n"
+            '  "scientific_name": "Solanum lycopersicum",\n'
+            '  "common_name": "Tomato",\n'
+            '  "disease": "Late Blight",\n'
+            '  "confidence": 94.5,\n'
+            '  "causes": ["High humidity", "Fungal spores"]\n'
+            "}"
+        ])
+
         text = response.text.strip()
         json_match = re.search(r"\{.*\}", text, re.DOTALL)
         if not json_match:
             raise ValueError("No JSON")
-            
+
         data = json.loads(json_match.group())
         return {
             "scientific_name": data.get("scientific_name", "Unknown"),
@@ -185,7 +194,7 @@ def call_gemini_api(file_content: bytes, filename: str) -> Dict:
             "confidence": float(data.get("confidence", 0)),
             "causes": data.get("causes", [])
         }
-        
+
     except Exception as e:
         logger.error(f"Gemini failed: {e}")
         return {
