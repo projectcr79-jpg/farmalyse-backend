@@ -153,50 +153,51 @@ def compress_image(file_content: bytes) -> bytes:
 # --------------------------------------------------------------------
 def call_gemini_api(file_content: bytes, filename: str) -> Dict:
     try:
-        # Configure Gemini
         genai.configure(api_key=gemini_api_key)
 
-        # Create in-memory file with explicit mime_type
-        from io import BytesIO
-        image_file = BytesIO(file_content)
-        image_file.name = filename  # Set filename for SDK
+        # THIS IS THE CORRECT NAME FOR GEMINI 2.5-FLASH (November 2025)
+        model = genai.GenerativeModel("gemini-2.5-flash-exp")
 
-        # Upload with mime_type
+        # Proper upload with mime_type
+        image_file = io.BytesIO(file_content)
+        image_file.name = filename or "leaf.jpg"
+
         uploaded_file = genai.upload_file(
-            image_file, 
-            mime_type="image/jpeg"  # ← FIXED: Explicit mime_type
+            path=image_file,
+            mime_type="image/jpeg"
         )
 
-        # Generate content
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        response = model.generate_content([
-            uploaded_file,
-            "Analyze this plant leaf image. Return ONLY valid JSON:\n"
-            "{\n"
-            '  "scientific_name": "Solanum lycopersicum",\n'
-            '  "common_name": "Tomato",\n'
-            '  "disease": "Late Blight",\n'
-            '  "confidence": 94.5,\n'
-            '  "causes": ["High humidity", "Fungal spores"]\n'
-            "}"
-        ])
+        # Strong prompt + force JSON
+        response = model.generate_content(
+            [
+                uploaded_file,
+                "You are a plant disease expert. Analyze this leaf image and return ONLY valid JSON with these keys:\n"
+                "scientific_name, common_name, disease (or 'Healthy'), confidence (0.0-100.0), causes (list)\n"
+                "Example: {\"scientific_name\":\"Solanum lycopersicum\",\"common_name\":\"Tomato\",\"disease\":\"Late Blight\",\"confidence\":98.7,\"causes\":[\"High humidity\",\"Fungus\"]}"
+            ],
+            safety_settings=[],
+            generation_config={
+                "response_mime_type": "application/json"   # ← FORCES JSON OUTPUT
+            }
+        )
 
-        text = response.text.strip()
-        json_match = re.search(r"\{.*\}", text, re.DOTALL)
-        if not json_match:
-            raise ValueError("No JSON")
+        # Direct JSON parsing (no regex needed with response_mime_type)
+        data = response.text.strip()
+        if data.startswith("```json"):
+            data = data.replace("```json", "").replace("```", "").strip()
 
-        data = json.loads(json_match.group())
+        result = json.loads(data)
+
         return {
-            "scientific_name": data.get("scientific_name", "Unknown"),
-            "common_name": data.get("common_name", "Unknown"),
-            "disease": data.get("disease", "None"),
-            "confidence": float(data.get("confidence", 0)),
-            "causes": data.get("causes", [])
+            "scientific_name": result.get("scientific_name", "Unknown"),
+            "common_name": result.get("common_name", "Unknown"),
+            "disease": result.get("disease", "None"),
+            "confidence": float(result.get("confidence", 0)),
+            "causes": result.get("causes", [])
         }
 
     except Exception as e:
-        logger.error(f"Gemini failed: {e}")
+        logger.error(f"Gemini 2.5 failed: {e}")
         return {
             "scientific_name": "Unknown",
             "common_name": "Unknown",
