@@ -150,76 +150,50 @@ def compress_image(file_content: bytes) -> bytes:
         return file_content  # fallback
 
 # --------------------------------------------------------------------
+import google.generativeai as genai
+
 def call_gemini_api(file_content: bytes, filename: str) -> Dict:
-    """Gemini 2.5 Flash detection with retry + timeout + safer JSON extraction."""
-
-    b64 = base64.b64encode(file_content).decode("utf-8")
-
-    prompt = (
-        "Analyze this plant leaf image. Return ONLY JSON with:\n"
-        "- scientific_name\n"
-        "- common_name\n"
-        "- disease ('None' if healthy)\n"
-        "- confidence (0-100)\n"
-        "- causes (2-3 causes)\n"
-    )
-
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-2.5-flash:generateContent?key={gemini_api_key}"
-    )
-
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt},
-                    {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
-                ]
-            }
-        ]
-    }
-
-    # ---- Retry up to 3 times ----
-    for attempt in range(3):
-        try:
-            response = requests.post(url, json=payload, timeout=50)
-            response.raise_for_status()
-
-            result = response.json()
-            logger.info(f"Gemini result: {result}")
-
-            text_part = result["candidates"][0]["content"]["parts"][0]["text"]
-
-            json_match = re.search(r"\{.*\}", text_part, re.DOTALL)
-            if not json_match:
-                return {
-                    "scientific_name": "Unknown",
-                    "common_name": "Unknown",
-                    "disease": "None",
-                    "confidence": 0.0,
-                    "causes": []
-                }
-
-            data = json.loads(json_match.group())
-            return {
-                "scientific_name": data.get("scientific_name", "Unknown"),
-                "common_name": data.get("common_name", "Unknown"),
-                "disease": data.get("disease", "None"),
-                "confidence": float(data.get("confidence", 0.0)),
-                "causes": data.get("causes", [])
-            }
-
-        except requests.exceptions.Timeout:
-            logger.warning(f"Gemini timeout retry {attempt + 1}/3")
-            if attempt == 2:
-                raise HTTPException(503, "Gemini API timed out")
-
-        except Exception as e:
-            logger.error(f"Gemini API error: {e}")
-            if attempt == 2:
-                raise HTTPException(503, "Gemini service unavailable")
-            time.sleep(1)
+    try:
+        # Configure with your key
+        genai.configure(api_key=gemini_api_key)
+        
+        # Use the stable public model
+        model = genai.GenerativeModel(
+            model_name="gemini-1.5-flash",
+            safety_settings=[]  # Required for Render to avoid blocks
+        )
+        
+        # Upload image
+        uploaded_file = genai.upload_file(io.BytesIO(file_content))
+        
+        # Generate response
+        response = model.generate_content(
+            [uploaded_file, "Analyze this crop/plant leaf. Return ONLY valid JSON with keys: scientific_name, common_name, disease, confidence (0-100), causes (list). Example: {\"scientific_name\": \"Solanum lycopersicum\", \"common_name\": \"Tomato\", \"disease\": \"Late Blight\", \"confidence\": 94.5, \"causes\": [\"High humidity\", \"Fungal spores\"]}"]
+        )
+        
+        text = response.text.strip()
+        json_match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not json_match:
+            raise ValueError("No JSON")
+            
+        data = json.loads(json_match.group())
+        return {
+            "scientific_name": data.get("scientific_name", "Unknown"),
+            "common_name": data.get("common_name", "Unknown"),
+            "disease": data.get("disease", "None"),
+            "confidence": float(data.get("confidence", 0)),
+            "causes": data.get("causes", [])
+        }
+        
+    except Exception as e:
+        logger.error(f"Gemini failed: {e}")
+        return {
+            "scientific_name": "Unknown",
+            "common_name": "Unknown",
+            "disease": "None",
+            "confidence": 0.0,
+            "causes": []
+        }
 
 # --------------------------------------------------------------------
 def get_remedy_from_openai(scientific_name: str, common_name: str, disease: str, causes: list) -> str:
