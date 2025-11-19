@@ -17,6 +17,7 @@ import json
 import re
 from PIL import Image
 import io
+import google.generativeai as genai
 
 # ---- Chatbot mount -------------------------------------------------
 from chatbot import chatbot_app
