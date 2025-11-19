@@ -152,59 +152,76 @@ def compress_image(file_content: bytes) -> bytes:
 
 # --------------------------------------------------------------------
 def call_gemini_api(file_content: bytes, filename: str) -> Dict:
-    try:
-        genai.configure(api_key=gemini_api_key)
+    """
+    Gemini 1.5 Flash-latest: Stable model for image analysis (v1beta, 2025).
+    """
+    b64 = base64.b64encode(file_content).decode("utf-8")
+    prompt = (
+        "Analyze this plant leaf image. Return ONLY JSON with:\n"
+        "- scientific_name\n"
+        "- common_name\n"
+        "- disease ('None' if healthy)\n"
+        "- confidence (0-100)\n"
+        "- causes (2-3 causes)\n"
+        "Example: {\"scientific_name\": \"Solanum lycopersicum\", \"common_name\": \"Tomato\", \"disease\": \"Late Blight\", \"confidence\": 94.5, \"causes\": [\"High humidity\", \"Fungal spores\"]}"
+    )
 
-        # THIS IS THE CORRECT NAME FOR GEMINI 2.5-FLASH (November 2025)
-        model = genai.GenerativeModel("gemini-2.5-flash-exp")
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-1.5-flash-latest:generateContent?key={gemini_api_key}"
+    )
 
-        # Proper upload with mime_type
-        image_file = io.BytesIO(file_content)
-        image_file.name = filename or "leaf.jpg"
-
-        uploaded_file = genai.upload_file(
-            path=image_file,
-            mime_type="image/jpeg"
-        )
-
-        # Strong prompt + force JSON
-        response = model.generate_content(
-            [
-                uploaded_file,
-                "You are a plant disease expert. Analyze this leaf image and return ONLY valid JSON with these keys:\n"
-                "scientific_name, common_name, disease (or 'Healthy'), confidence (0.0-100.0), causes (list)\n"
-                "Example: {\"scientific_name\":\"Solanum lycopersicum\",\"common_name\":\"Tomato\",\"disease\":\"Late Blight\",\"confidence\":98.7,\"causes\":[\"High humidity\",\"Fungus\"]}"
-            ],
-            safety_settings=[],
-            generation_config={
-                "response_mime_type": "application/json"   # ← FORCES JSON OUTPUT
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
+                ]
             }
-        )
+        ]
+    }
 
-        # Direct JSON parsing (no regex needed with response_mime_type)
-        data = response.text.strip()
-        if data.startswith("```json"):
-            data = data.replace("```json", "").replace("```", "").strip()
+    # Retry up to 3 times
+    for attempt in range(3):
+        try:
+            response = requests.post(url, json=payload, timeout=50)
+            response.raise_for_status()
 
-        result = json.loads(data)
+            result = response.json()
+            logger.info(f"Gemini result: {result}")
 
-        return {
-            "scientific_name": result.get("scientific_name", "Unknown"),
-            "common_name": result.get("common_name", "Unknown"),
-            "disease": result.get("disease", "None"),
-            "confidence": float(result.get("confidence", 0)),
-            "causes": result.get("causes", [])
-        }
+            text_part = result["candidates"][0]["content"]["parts"][0]["text"]
 
-    except Exception as e:
-        logger.error(f"Gemini 2.5 failed: {e}")
-        return {
-            "scientific_name": "Unknown",
-            "common_name": "Unknown",
-            "disease": "None",
-            "confidence": 0.0,
-            "causes": []
-        }
+            json_match = re.search(r"\{.*\}", text_part, re.DOTALL)
+            if not json_match:
+                return {
+                    "scientific_name": "Unknown",
+                    "common_name": "Unknown",
+                    "disease": "None",
+                    "confidence": 0.0,
+                    "causes": []
+                }
+
+            data = json.loads(json_match.group())
+            return {
+                "scientific_name": data.get("scientific_name", "Unknown"),
+                "common_name": data.get("common_name", "Unknown"),
+                "disease": data.get("disease", "None"),
+                "confidence": float(data.get("confidence", 0.0)),
+                "causes": data.get("causes", [])
+            }
+
+        except requests.exceptions.Timeout:
+            logger.warning(f"Gemini timeout retry {attempt + 1}/3")
+            if attempt == 2:
+                raise HTTPException(503, "Gemini API timed out")
+
+        except Exception as e:
+            logger.error(f"Gemini API error: {e}")
+            if attempt == 2:
+                raise HTTPException(503, "Gemini service unavailable")
+            time.sleep(1)
 
 # --------------------------------------------------------------------
 def get_remedy_from_openai(scientific_name: str, common_name: str, disease: str, causes: list) -> str:
