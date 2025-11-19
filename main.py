@@ -168,7 +168,7 @@ def call_gemini_api(file_content: bytes, filename: str) -> Dict:
     # FIXED: v1 endpoint + stable 2.5 Flash model
     url = (
         f"https://generativelanguage.googleapis.com/v1/models/"
-        f"gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+        f"gemini-2.5-flash:generateContent?key={gemini_api_key}"
     )
 
     payload = {
